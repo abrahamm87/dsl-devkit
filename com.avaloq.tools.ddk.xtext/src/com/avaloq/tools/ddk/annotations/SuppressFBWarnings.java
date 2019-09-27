@@ -9,21 +9,25 @@
  *     Avaloq Evolution AG - initial API and implementation
  *******************************************************************************/
 
-package com.avaloq.tools.ddk.check.compiler;
+package com.avaloq.tools.ddk.annotations;
 
-import org.eclipse.emf.common.util.URI;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
 
 
 /**
- * Default dummy implementation of config provider.
+ * Used to suppress FindBugs warnings.
  */
-public class CheckGeneratorConfigProvider implements ICheckGeneratorConfigProvider {
+@Retention(RetentionPolicy.CLASS)
+public @interface SuppressFBWarnings {
+  /**
+   * The set of FindBugs warnings that are to be suppressed in
+   * annotated element. The value can be a bug category, kind or pattern.
+   */
+  String[] value() default {};
 
-  private static final CheckGeneratorConfig CONFIG_INSTANCE = new CheckGeneratorConfig();
-
-  @Override
-  public CheckGeneratorConfig get(final URI uri) {
-    return CONFIG_INSTANCE;
-  }
-
+  /**
+   * Optional documentation of the reason why the warning is suppressed.
+   */
+  String justification() default "";
 }

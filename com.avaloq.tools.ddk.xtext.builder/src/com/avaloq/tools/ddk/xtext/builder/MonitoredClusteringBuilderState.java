@@ -14,6 +14,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -83,7 +84,6 @@ import com.avaloq.tools.ddk.xtext.scoping.ImplicitReferencesAdapter;
 import com.avaloq.tools.ddk.xtext.tracing.ITraceSet;
 import com.avaloq.tools.ddk.xtext.tracing.ResourceValidationRuleSummaryEvent;
 import com.avaloq.tools.ddk.xtext.util.EmfResourceSetUtil;
-import com.google.common.base.Optional;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableListMultimap;
 import com.google.common.collect.Iterables;
@@ -112,6 +112,7 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
   public static final long CANCELLATION_POLLING_DELAY = 200; // ms
 
   public static final int STACK_TRACE_LIMIT = 10;
+  private static final int COMMIT_WARN_WAIT_SEC = 30;
 
   /** Class-wide logger. */
   private static final Logger LOGGER = Logger.getLogger(MonitoredClusteringBuilderState.class);
@@ -156,9 +157,6 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
   private IDescriptionCopier descriptionCopier;
 
   @Inject
-  private IResourcePostProcessor postProcessor;
-
-  @Inject
   private OperationCanceledManager operationCanceledManager;
 
   @Inject
@@ -174,6 +172,8 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
    * Handle to index extension storing associations to derived objects.
    */
   private IDerivedObjectAssociationsStore derivedObjectAssociationsStore;
+
+  private final Object associationsStoreLock = new Object();
 
   /**
    * Copied handle to the plain ResourceDescriptionsData.
@@ -242,8 +242,16 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
     return this.isLoaded;
   }
 
+  /**
+   * Sets the derived object associations store.
+   *
+   * @param associationsStore
+   *          the new derived object associations store
+   */
   protected void setDerivedObjectAssociationsStore(final IDerivedObjectAssociationsStore associationsStore) {
-    derivedObjectAssociationsStore = associationsStore;
+    synchronized (associationsStoreLock) {
+      derivedObjectAssociationsStore = associationsStore;
+    }
   }
 
   @Override
@@ -355,28 +363,27 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
     Collection<IResourceDescription.Delta> deltas = doClean(toBeRemovedCopy, subMonitor.newChild(1));
 
     final ResourceDescriptionsData newData = getCopiedResourceDescriptionsData();
-    ResourceDescriptionChangeEvent event = null;
+
+    checkForCancellation(monitor);
     try {
-      checkForCancellation(monitor);
       for (IResourceDescription.Delta delta : deltas) {
         newData.removeDescription(delta.getOld().getURI());
       }
-      event = new ResourceDescriptionChangeEvent(deltas);
+      ResourceDescriptionChangeEvent event = new ResourceDescriptionChangeEvent(deltas);
       checkForCancellation(monitor);
       updateDeltas(event.getDeltas(), null, subMonitor.newChild(1));
       // update the reference
       setResourceDescriptionsData(newData, monitor);
       // CHECKSTYLE:CHECK-OFF IllegalCatch
+      notifyListeners(event);
+      return event.getDeltas();
     } catch (Throwable t) {
-      // CHECKSTYLE:CHEKC-ON IllegalCatch
+      // CHECKSTYLE:CHECK-ON IllegalCatch
       if (newData instanceof AbstractResourceDescriptionsData) {
         ((AbstractResourceDescriptionsData) newData).rollbackChanges();
       }
       throw t;
     }
-
-    notifyListeners(event);
-    return event.getDeltas();
   }
 
   /** {@inheritDoc} */
@@ -399,6 +406,8 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
 
     propagateDependencyChains(buildData.getToBeUpdated(), newState);
 
+    // These descriptions are mainly used to compute the set of invalidated resources
+    // Therefore, contain only the objects fingerprint, other user data items are not saved
     final Map<URI, IResourceDescription> oldDescriptions = saveOldDescriptions(buildData);
 
     final Map<URI, DerivedObjectAssociations> oldDerivedObjectAssociations = saveOldDerivedObjectAssociations(buildData);
@@ -493,9 +502,14 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
           Resource resource = null;
           Delta newDelta = null;
 
-          final long initialMemory = Runtime.getRuntime().freeMemory();
-          final int initialResourceSetSize = resourceSet.getResources().size();
-          final long initialTime = System.nanoTime();
+          long initialMemory = 0;
+          int initialResourceSetSize = 0;
+          long initialTime = 0;
+          if (traceSet.isEnabled(ResourceLinkingMemoryEvent.class)) {
+            initialMemory = Runtime.getRuntime().freeMemory();
+            initialResourceSetSize = resourceSet.getResources().size();
+            initialTime = System.nanoTime();
+          }
           try {
             // Load the resource and create a new resource description
             resource = addResource(loadOperation.next().getResource(), resourceSet);
@@ -575,7 +589,6 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
             try {
               // Validate directly, instead of bulk validating after the cluster.
               updateMarkers(newDelta, resourceSet, subProgress.newChild(1, SubMonitor.SUPPRESS_ALL_LABELS));
-              postProcess(newDelta, resourceSet, subProgress.newChild(1));
             } catch (StackOverflowError ex) {
               queue.remove(changedURI);
               logStackOverflowErrorStackTrace(ex, changedURI);
@@ -585,10 +598,12 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
           }
 
           if (changedURI != null) {
-            final long memoryDelta = Runtime.getRuntime().freeMemory() - initialMemory;
-            final int resourceSetSizeDelta = resourceSet.getResources().size() - initialResourceSetSize;
-            final long timeDelta = System.nanoTime() - initialTime;
-            traceSet.trace(ResourceLinkingMemoryEvent.class, changedURI, memoryDelta, resourceSetSizeDelta, timeDelta);
+            if (traceSet.isEnabled(ResourceLinkingMemoryEvent.class)) {
+              final long memoryDelta = Runtime.getRuntime().freeMemory() - initialMemory;
+              final int resourceSetSizeDelta = resourceSet.getResources().size() - initialResourceSetSize;
+              final long timeDelta = System.nanoTime() - initialTime;
+              traceSet.trace(ResourceLinkingMemoryEvent.class, changedURI, memoryDelta, resourceSetSizeDelta, timeDelta);
+            }
             watchdog.reportWorkEnded(index, index + queue.size());
           }
 
@@ -710,22 +725,7 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
     for (Delta delta : deltas) {
       checkForCancellation(monitor);
       updateMarkers(delta, resourceSet, progress.newChild(1));
-      postProcess(delta, resourceSet, progress.newChild(1));
     }
-  }
-
-  /**
-   * Post-processes a delta.
-   *
-   * @param delta
-   *          to process
-   * @param resourceSet
-   *          to use for resource loading (the builder's resourceSet)
-   * @param monitor
-   *          to report progress and handle cancellation
-   */
-  protected void postProcess(final Delta delta, final ResourceSet resourceSet, final IProgressMonitor monitor) {
-    postProcessor.process(delta, resourceSet, monitor);
   }
 
   /**
@@ -745,7 +745,7 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
     if (saved == null) {
       // TODO DSL-828: this may end up using a lot of memory; we should instead consider creating old copies of the resources in the db
       IResourceDescription old = getResourceDescription(uri);
-      saved = old != null ? new FixedCopiedResourceDescription(old) : null;
+      saved = old != null ? new FingerprintResourceDescription(old) : null;
     } else if (saved == NULL_DESCRIPTION) { // NOPMD
       saved = null; // NOPMD
     }
@@ -762,9 +762,8 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
   protected Map<URI, IResourceDescription> saveOldDescriptions(final BuildData buildData) {
     Map<URI, IResourceDescription> cache = Maps.newHashMapWithExpectedSize(buildData.getToBeUpdated().size());
     for (URI uri : Iterables.concat(buildData.getToBeUpdated(), buildData.getToBeDeleted())) {
-      cache.computeIfAbsent(uri, u -> Optional.fromNullable(getResourceDescription(u))
-          // Do *not* use descriptionCopier here, we just want the EObjectDescriptions!
-          .<IResourceDescription> transform(FixedCopiedResourceDescription::new).or(NULL_DESCRIPTION));
+      // Do *not* use descriptionCopier here, we just want the EObjectDescriptions!
+      cache.computeIfAbsent(uri, u -> Optional.ofNullable(getResourceDescription(u)).<IResourceDescription> map(FingerprintResourceDescription::new).orElse(NULL_DESCRIPTION));
     }
     return cache;
   }
@@ -777,10 +776,11 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
    * @return a map containing associations for objects derived from resources identified by their URIs
    */
   protected Map<URI, DerivedObjectAssociations> saveOldDerivedObjectAssociations(final BuildData buildData) {
-    if (derivedObjectAssociationsStore != null) {
+    IDerivedObjectAssociationsStore associationStore = getDerivedObjectAssociationsStore();
+    if (associationStore != null) {
       Map<URI, DerivedObjectAssociations> cache = Maps.newHashMapWithExpectedSize(buildData.getToBeUpdated().size());
       for (URI uri : Iterables.concat(buildData.getToBeUpdated(), buildData.getToBeDeleted())) {
-        cache.computeIfAbsent(uri, derivedObjectAssociationsStore::getAssociations);
+        cache.computeIfAbsent(uri, associationStore::getAssociations);
       }
       return cache;
     }
@@ -799,11 +799,18 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
    */
   protected DerivedObjectAssociations getSavedDerivedObjectAssociations(final Map<URI, DerivedObjectAssociations> oldDerivedObjectAssociations, final URI uri) {
     DerivedObjectAssociations associations = oldDerivedObjectAssociations.get(uri);
-    if (associations == null && derivedObjectAssociationsStore != null) {
+    IDerivedObjectAssociationsStore associationsStore = getDerivedObjectAssociationsStore();
+    if (associations == null && associationsStore != null) {
       // Resource was not processed by the indexing phase, so we should still have the old state in the Index
-      associations = derivedObjectAssociationsStore.getAssociations(uri);
+      associations = associationsStore.getAssociations(uri);
     }
     return associations;
+  }
+
+  private IDerivedObjectAssociationsStore getDerivedObjectAssociationsStore() {
+    synchronized (associationsStoreLock) {
+      return derivedObjectAssociationsStore;
+    }
   }
 
   /**
@@ -833,7 +840,7 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
    *          The progress monitor used for user feedback
    * @return the list of {@link URI}s of loaded resources to be processed in the second phase
    */
-  private List<URI> writeResources(final Collection<URI> toWrite, final BuildData buildData, final IResourceDescriptions oldState, final CurrentDescriptions newState, final IProgressMonitor monitor) {
+  private List<URI> writeResources(final Collection<URI> toWrite, final BuildData buildData, final IResourceDescriptions oldState, final CurrentDescriptions newState, final IProgressMonitor monitor) { // NOPMD NPath Complexity
     ResourceSet resourceSet = buildData.getResourceSet();
     IProject currentProject = getBuiltProject(buildData);
     List<URI> toBuild = Lists.newLinkedList();
@@ -877,7 +884,7 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
           if (uri == null && ex instanceof LoadOperationException) { // NOPMD
             uri = ((LoadOperationException) ex).getUri();
           }
-          LOGGER.error(NLS.bind(Messages.MonitoredClusteringBuilderState_CANNOT_LOAD_RESOURCE, uri), ex);
+          LOGGER.error(NLS.bind(Messages.MonitoredClusteringBuilderState_CANNOT_LOAD_RESOURCE, uri != null ? uri: "unknown uri"), ex); //$NON-NLS-1$
           if (resource != null) {
             resourceSet.getResources().remove(resource);
           }
@@ -979,11 +986,16 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
    */
   protected void flushChanges(final ResourceDescriptionsData newData) {
     if (newData instanceof IResourceDescriptionsData) {
+      long time = System.currentTimeMillis();
       try {
         traceSet.started(BuildFlushEvent.class);
         ((IResourceDescriptionsData) newData).flushChanges();
       } finally {
         traceSet.ended(BuildFlushEvent.class);
+      }
+      long flushTime = TimeUnit.MILLISECONDS.toSeconds(System.currentTimeMillis() - time);
+      if (flushTime > COMMIT_WARN_WAIT_SEC) {
+        LOGGER.warn("Flushing of the database changes took " + flushTime + " seconds."); //$NON-NLS-1$//$NON-NLS-2$
       }
     }
   }
