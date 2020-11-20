@@ -17,6 +17,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Queue;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
@@ -38,6 +40,8 @@ import org.eclipse.xtext.builder.clustering.CurrentDescriptions;
 import org.eclipse.xtext.builder.impl.BuildData;
 import org.eclipse.xtext.builder.resourceloader.IResourceLoader;
 import org.eclipse.xtext.builder.resourceloader.IResourceLoader.LoadOperationException;
+import org.eclipse.xtext.generator.IFileSystemAccess;
+import org.eclipse.xtext.generator.IFileSystemAccessExtension3;
 import org.eclipse.xtext.resource.IEObjectDescription;
 import org.eclipse.xtext.resource.IReferenceDescription;
 import org.eclipse.xtext.resource.IResourceDescription;
@@ -49,12 +53,14 @@ import org.eclipse.xtext.resource.XtextResource;
 import org.eclipse.xtext.resource.impl.DefaultResourceDescriptionDelta;
 import org.eclipse.xtext.resource.impl.ResourceDescriptionChangeEvent;
 import org.eclipse.xtext.resource.impl.ResourceDescriptionsData;
+import org.eclipse.xtext.resource.persistence.IResourceStorageFacade;
 import org.eclipse.xtext.resource.persistence.StorageAwareResource;
 import org.eclipse.xtext.service.OperationCanceledManager;
 import org.eclipse.xtext.util.CancelIndicator;
 import org.eclipse.xtext.util.Pair;
 import org.eclipse.xtext.util.Tuples;
 
+import com.avaloq.tools.ddk.caching.CacheManager;
 import com.avaloq.tools.ddk.xtext.build.BuildPhases;
 import com.avaloq.tools.ddk.xtext.builder.layered.ILayeredResourceDescriptions;
 import com.avaloq.tools.ddk.xtext.builder.layered.IXtextBuildTrigger;
@@ -65,7 +71,6 @@ import com.avaloq.tools.ddk.xtext.builder.tracing.BuildFlushEvent;
 import com.avaloq.tools.ddk.xtext.builder.tracing.BuildIndexingEvent;
 import com.avaloq.tools.ddk.xtext.builder.tracing.BuildLinkingEvent;
 import com.avaloq.tools.ddk.xtext.builder.tracing.BuildResourceSetClearEvent;
-import com.avaloq.tools.ddk.xtext.builder.tracing.ClusterClosedEvent;
 import com.avaloq.tools.ddk.xtext.builder.tracing.ResourceIndexingEvent;
 import com.avaloq.tools.ddk.xtext.builder.tracing.ResourceLinkingEvent;
 import com.avaloq.tools.ddk.xtext.builder.tracing.ResourceLinkingMemoryEvent;
@@ -79,6 +84,7 @@ import com.avaloq.tools.ddk.xtext.resource.AbstractCachingResourceDescriptionMan
 import com.avaloq.tools.ddk.xtext.resource.AbstractResourceDescriptionDelta;
 import com.avaloq.tools.ddk.xtext.resource.extensions.ForwardingResourceDescriptions;
 import com.avaloq.tools.ddk.xtext.resource.extensions.IResourceDescriptions2;
+import com.avaloq.tools.ddk.xtext.resource.persistence.DirectLinkingResourceStorageFacade;
 import com.avaloq.tools.ddk.xtext.resource.persistence.DirectLinkingSourceLevelURIsAdapter;
 import com.avaloq.tools.ddk.xtext.scoping.ImplicitReferencesAdapter;
 import com.avaloq.tools.ddk.xtext.tracing.ITraceSet;
@@ -135,10 +141,6 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
   @Named(RESOURCELOADER_CROSS_LINKING)
   private IResourceLoader crossLinkingResourceLoader;
 
-  /** Strategy to dynamically adapt cluster sizes. */
-  @Inject
-  private IBuilderResourceLoadStrategy loadingStrategy;
-
   /** Sorter to sort the resources for phase 1. */
   @Inject
   @Named(PHASE_ONE_BUILD_SORTER)
@@ -161,6 +163,11 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
 
   @Inject
   private IResourceServiceProvider.Registry resourceServiceProviderRegistry;
+
+  @Inject(optional = true)
+  private IFileSystemAccess fileSystemAccess;
+
+  private final ForkJoinPool binaryStorageExecutor = new ForkJoinPool(4);
 
   /**
    * Handle to the ResourceDescriptionsData we use viewed as a IResourceDescriptions2 (with findReferences()). Parent class does not provide direct access to
@@ -197,6 +204,11 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
   private final IXtextTargetPlatformManager targetPlatformManager;
 
   /**
+   * During startup (and maybe in other cases) it is possible for us to be given a default platform which has no binary storage.
+   */
+  private boolean isBinaryModelStorageAvailable;
+
+  /**
    * Creates a new instance of {@link MonitoredClusteringBuilderState}.
    *
    * @param manager
@@ -221,6 +233,7 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
       IXtextTargetPlatform platform = targetPlatformManager.getPlatform();
       setDerivedObjectAssociationsStore(platform.getAssociationsStore());
       setResourceDescriptionsData((ResourceDescriptionsData) platform.getIResourceDescriptionsData());
+      updateBinaryStorageAvailability(platform);
       isLoaded = true;
     }
   }
@@ -413,6 +426,7 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
     final Map<URI, DerivedObjectAssociations> oldDerivedObjectAssociations = saveOldDerivedObjectAssociations(buildData);
 
     buildData.getSourceLevelURICache().cacheAsSourceURIs(toBeDeleted);
+    deleteBinaryResources(toBeDeleted);
     installSourceLevelURIs(buildData);
 
     // Step 3: Create a queue; write new temporary resource descriptions for the added or updated resources
@@ -489,7 +503,7 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
         // CHECKSTYLE:CONSTANTS-ON
         final List<Delta> newDeltas = Lists.newArrayListWithExpectedSize(clusterSize);
         final List<Delta> changedDeltas = Lists.newArrayListWithExpectedSize(clusterSize);
-        while (!queue.isEmpty() && loadingStrategy.mayProcessAnotherResource(resourceSet, newDeltas.size())) {
+        while (!queue.isEmpty()) {
           if (subProgress.isCanceled() || !loadOperation.hasNext()) {
             if (!loadOperation.hasNext()) {
               LOGGER.warn(Messages.MonitoredClusteringBuilderState_NO_MORE_RESOURCES);
@@ -611,11 +625,12 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
           if (resource instanceof XtextResource) {
             ((XtextResource) resource).getCache().clear(resource);
           }
+          storeBinaryResource(resource, buildData);
           traceSet.ended(ResourceProcessingEvent.class);
           buildData.getSourceLevelURICache().getSources().remove(changedURI);
           subProgress.worked(1);
           index++;
-        }
+        } // inner loop end
 
         loadOperation.cancel();
 
@@ -629,20 +644,18 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
         }
 
         if (!queue.isEmpty()) {
-          traceSet.trace(ClusterClosedEvent.class, Long.valueOf(resourceSet.getResources().size()));
           clearResourceSet(resourceSet);
         }
         // TODO flush required here or elsewhere ?
         // flushChanges(newData);
-      }
+      } // outer loop end
     } finally {
-      // Report the current size of the resource set
-      traceSet.trace(ClusterClosedEvent.class, Long.valueOf(resourceSet.getResources().size()));
       if (loadOperation != null) {
         loadOperation.cancel();
       }
       traceSet.ended(BuildLinkingEvent.class);
       watchdog.interrupt();
+      awaitBinaryStorageExecutorQuiescence();
     }
     return allDeltas;
     // CHECKSTYLE:CHECK-ON NestedTryDepth
@@ -662,6 +675,70 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
       return resource;
     } else {
       return r;
+    }
+  }
+
+  /**
+   * Stores the process resource as a binary if it doesn't contain syntax or linking errors.
+   *
+   * @param resource
+   *          resource to store, must not be {@code null}
+   * @param buildData
+   *          build data, must not be {@code null}
+   */
+  protected void storeBinaryResource(final Resource resource, final BuildData buildData) {
+    if (isBinaryModelStorageAvailable && resource instanceof StorageAwareResource && ((StorageAwareResource) resource).getResourceStorageFacade() != null
+        && fileSystemAccess instanceof IFileSystemAccessExtension3) {
+      CompletableFuture.runAsync(() -> {
+        final long maxTaskExecutionNanos = TimeUnit.NANOSECONDS.convert(1, TimeUnit.SECONDS);
+
+        try {
+          long elapsed = System.nanoTime();
+
+          IResourceStorageFacade storageFacade = ((StorageAwareResource) resource).getResourceStorageFacade();
+          storageFacade.saveResource((StorageAwareResource) resource, (IFileSystemAccessExtension3) fileSystemAccess);
+          buildData.getSourceLevelURICache().getSources().remove(resource.getURI());
+
+          elapsed = System.nanoTime() - elapsed;
+          if (elapsed > maxTaskExecutionNanos) {
+            LOGGER.info("saving binary taking longer than expected (" + elapsed + " ns) : " + resource.getURI()); //$NON-NLS-1$ //$NON-NLS-2$
+          }
+          // CHECKSTYLE:OFF
+        } catch (Throwable ex) {
+          // CHECKSTYLE:ON
+          LOGGER.error("Failed to save binary for " + resource.getURI(), ex); //$NON-NLS-1$
+        }
+      }, binaryStorageExecutor);
+    }
+  }
+
+  /**
+   * Deletes the binary models for the given set of URIs.
+   *
+   * @param toBeDeleted
+   *          set of URIs, must not be {@code null}
+   */
+  protected void deleteBinaryResources(final Set<URI> toBeDeleted) {
+    if (!isBinaryModelStorageAvailable || fileSystemAccess == null) {
+      return;
+    }
+    for (URI uri : toBeDeleted) {
+      IResourceStorageFacade resourceStorageFacade = resourceServiceProviderRegistry.getResourceServiceProvider(uri).get(IResourceStorageFacade.class);
+      if (resourceStorageFacade instanceof DirectLinkingResourceStorageFacade) {
+        ((DirectLinkingResourceStorageFacade) resourceStorageFacade).deleteStorage(uri, fileSystemAccess);
+      }
+    }
+  }
+
+  /**
+   * Waits until binary models are stored.
+   */
+  protected void awaitBinaryStorageExecutorQuiescence() {
+    int activeThreadCount = binaryStorageExecutor.getActiveThreadCount();
+    long queuedTaskCount = binaryStorageExecutor.getQueuedTaskCount();
+    if (!binaryStorageExecutor.awaitQuiescence(1, TimeUnit.MINUTES)) {
+      LOGGER.warn(String.format("Binary resource storage tasks not completed in time, start with task / queue %d / %d; now have %d / %d", //$NON-NLS-1$
+          activeThreadCount, queuedTaskCount, binaryStorageExecutor.getActiveThreadCount(), binaryStorageExecutor.getQueuedTaskCount()));
     }
   }
 
@@ -745,7 +822,7 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
     if (saved == null) {
       // TODO DSL-828: this may end up using a lot of memory; we should instead consider creating old copies of the resources in the db
       IResourceDescription old = getResourceDescription(uri);
-      saved = old != null ? new FingerprintResourceDescription(old) : null;
+      saved = old != null ? createOldStateResourceDescription(old) : null;
     } else if (saved == NULL_DESCRIPTION) { // NOPMD
       saved = null; // NOPMD
     }
@@ -763,9 +840,28 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
     Map<URI, IResourceDescription> cache = Maps.newHashMapWithExpectedSize(buildData.getToBeUpdated().size());
     for (URI uri : Iterables.concat(buildData.getToBeUpdated(), buildData.getToBeDeleted())) {
       // Do *not* use descriptionCopier here, we just want the EObjectDescriptions!
-      cache.computeIfAbsent(uri, u -> Optional.ofNullable(getResourceDescription(u)).<IResourceDescription> map(FingerprintResourceDescription::new).orElse(NULL_DESCRIPTION));
+      cache.computeIfAbsent(uri, u -> Optional.ofNullable(getResourceDescription(u)).<IResourceDescription> map(this::createOldStateResourceDescription).orElse(NULL_DESCRIPTION));
     }
     return cache;
+  }
+
+  /**
+   * Create a resource description's copy that represents the old state of a resource. Will be used to compute invalidations.
+   * (see 'oldDescriptions' in doUpdate(BuildData, ResourceDescriptionsData, IProgressMonitor))
+   *
+   * @param original
+   *          original resource description, must not be {@code null}
+   * @return a copy, never {@code null}
+   */
+  private IResourceDescription createOldStateResourceDescription(final IResourceDescription original) {
+    IResourceServiceProvider provider = IResourceServiceProvider.Registry.INSTANCE.getResourceServiceProvider(original.getURI());
+    if (provider != null && provider.getResourceDescriptionManager() instanceof AbstractCachingResourceDescriptionManager) {
+      // FingerprintResourceDescription is a lightweight implementation that contains only the information for computation of invalidated resources
+      // Should be however used only for those DSLs, which use DDK's custom resource descriptions deltas
+      // This is the case if language's IResourceDescription.Manager implementation subclasses AbstractCachingResourceDescriptionManager
+      return new FingerprintResourceDescription(original);
+    }
+    return new FixedCopiedResourceDescription(original);
   }
 
   /**
@@ -840,7 +936,9 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
    *          The progress monitor used for user feedback
    * @return the list of {@link URI}s of loaded resources to be processed in the second phase
    */
-  private List<URI> writeResources(final Collection<URI> toWrite, final BuildData buildData, final IResourceDescriptions oldState, final CurrentDescriptions newState, final IProgressMonitor monitor) { // NOPMD NPath Complexity
+  private List<URI> writeResources(final Collection<URI> toWrite, final BuildData buildData, final IResourceDescriptions oldState, final CurrentDescriptions newState, final IProgressMonitor monitor) { // NOPMD
+                                                                                                                                                                                                         // NPath
+                                                                                                                                                                                                         // Complexity
     ResourceSet resourceSet = buildData.getResourceSet();
     IProject currentProject = getBuiltProject(buildData);
     List<URI> toBuild = Lists.newLinkedList();
@@ -884,7 +982,7 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
           if (uri == null && ex instanceof LoadOperationException) { // NOPMD
             uri = ((LoadOperationException) ex).getUri();
           }
-          LOGGER.error(NLS.bind(Messages.MonitoredClusteringBuilderState_CANNOT_LOAD_RESOURCE, uri != null ? uri: "unknown uri"), ex); //$NON-NLS-1$
+          LOGGER.error(NLS.bind(Messages.MonitoredClusteringBuilderState_CANNOT_LOAD_RESOURCE, uri != null ? uri : "unknown uri"), ex); //$NON-NLS-1$
           if (resource != null) {
             resourceSet.getResources().remove(resource);
           }
@@ -913,9 +1011,6 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
           monitor.worked(1);
         }
 
-        if (!loadingStrategy.mayProcessAnotherResource(resourceSet, resourceSet.getResources().size())) {
-          clearResourceSet(resourceSet);
-        }
         index++;
       }
     } finally {
@@ -928,7 +1023,7 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
 
   /** {@inheritDoc} */
   protected void writeNewResourceDescriptions(final BuildData buildData, final IResourceDescriptions oldState, final CurrentDescriptions newState, final ResourceDescriptionsData newData, final IProgressMonitor monitor) {
-    final List<List<URI>> toWriteGroups = phaseOneBuildSorter.sort(buildData.getToBeUpdated(), oldState);
+    final List<List<URI>> toWriteGroups = phaseOneBuildSorter.sort(buildData.getToBeUpdated());
     final List<URI> toBuild = Lists.newLinkedList();
     ResourceSet resourceSet = buildData.getResourceSet();
     BuildPhases.setIndexing(resourceSet, true);
@@ -955,7 +1050,7 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
       // Clear the flags
       BuildPhases.setIndexing(resourceSet, false);
       resourceSet.getLoadOptions().remove(ILazyLinkingResource2.MARK_UNRESOLVABLE_XREFS);
-      phaseTwoBuildSorter.sort(toBuild, oldState).stream().flatMap(List::stream).forEach(buildData::queueURI);
+      phaseTwoBuildSorter.sort(toBuild).stream().flatMap(List::stream).forEach(buildData::queueURI);
       traceSet.ended(BuildIndexingEvent.class);
     }
 
@@ -970,6 +1065,10 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
    */
   @Override
   protected void clearResourceSet(final ResourceSet resourceSet) {
+    // this is important as otherwise the resources would unexpectedly become detached from the resource set
+    while (!binaryStorageExecutor.awaitQuiescence(1, TimeUnit.SECONDS)) {
+      LOGGER.warn("Waiting for binary resource storage tasks to complete."); //$NON-NLS-1$
+    }
     traceSet.started(BuildResourceSetClearEvent.class, resourceSet.getResources().size());
     try {
       EmfResourceSetUtil.clearResourceSetWithoutNotifications(resourceSet);
@@ -1022,7 +1121,7 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
       super(baseDescriptions);
     }
 
-    private final Map<Pair<Set<IResourceDescription>, ReferenceMatchPolicy>, Iterable<IResourceDescription>> findAllReferencingResourcesCache = Maps.newHashMap();
+    private final Map<Pair<Set<IResourceDescription>, ReferenceMatchPolicy>, Iterable<IResourceDescription>> findAllReferencingResourcesCache = CacheManager.getInstance().createMapCache("FindReferenceCachingState#findAllReferencingResourcesCache"); //$NON-NLS-1$
 
     @Override
     public Iterable<IResourceDescription> findAllReferencingResources(final Set<IResourceDescription> targetResources, final ReferenceMatchPolicy matchPolicy) {
@@ -1035,7 +1134,7 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
       return result;
     }
 
-    private final Map<Pair<Set<IEObjectDescription>, ReferenceMatchPolicy>, Iterable<IResourceDescription>> findExactReferencingResourcesCache = Maps.newHashMap();
+    private final Map<Pair<Set<IEObjectDescription>, ReferenceMatchPolicy>, Iterable<IResourceDescription>> findExactReferencingResourcesCache = CacheManager.getInstance().createMapCache("FindReferenceCachingState#findExactReferencingResourcesCache"); //$NON-NLS-1$
 
     @Override
     public Iterable<IResourceDescription> findExactReferencingResources(final Set<IEObjectDescription> targetObjects, final ReferenceMatchPolicy matchPolicy) {
@@ -1266,6 +1365,7 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
       // TODO: check!
       setDerivedObjectAssociationsStore(null);
       setResourceDescriptionsData(new NullResourceDescriptionsData());
+      isBinaryModelStorageAvailable = false;
       return;
     }
     // Deltas?
@@ -1280,6 +1380,7 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
       }
       setDerivedObjectAssociationsStore(newPlatform.getAssociationsStore());
       setResourceDescriptionsData(data);
+      updateBinaryStorageAvailability(newPlatform);
       ResourceDescriptionChangeEvent event = new ResourceDescriptionChangeEvent(deltas);
       notifyListeners(event);
     }
@@ -1290,10 +1391,6 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
 
   protected int getClusterSize() {
     return clusterSize;
-  }
-
-  protected IBuilderResourceLoadStrategy getLoadingStrategy() {
-    return loadingStrategy;
   }
 
   protected IResourceLoader getCrossLinkingResourceLoader() {
@@ -1324,4 +1421,15 @@ public class MonitoredClusteringBuilderState extends ClusteringBuilderState
     }
     DirectLinkingSourceLevelURIsAdapter.setSourceLevelUris(resourceSet, buildData.getSourceLevelURICache().getSources());
   }
+
+  /**
+   * Set the flag indicating if binary models can be stored based on if the storage is available in the given platform.
+   *
+   * @param platform
+   *          the platform to test, may not be {@code null}.
+   */
+  protected void updateBinaryStorageAvailability(final IXtextTargetPlatform platform) {
+    isBinaryModelStorageAvailable = platform.getBinaryModelStore() != null;
+  }
+
 }

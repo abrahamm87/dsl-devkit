@@ -44,6 +44,7 @@ import org.eclipse.xtext.resource.IResourceDescription.Delta;
 import org.eclipse.xtext.resource.impl.ResourceDescriptionsProvider;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Maps;
 import com.google.inject.Inject;
 
@@ -129,7 +130,7 @@ public class RebuildingXtextBuilder extends XtextBuilder {
     SubMonitor progress = SubMonitor.convert(monitor, 2);
     try {
       ToBeBuilt toBeBuilt = getToBeBuiltComputer().removeProject(getProject(), progress.newChild(1));
-      doClean(toBeBuilt, progress.newChild(1));
+      doClean(toBeBuilt, ImmutableSet.of(), progress.newChild(1));
     } finally {
       if (monitor != null) {
         monitor.done();
@@ -168,7 +169,7 @@ public class RebuildingXtextBuilder extends XtextBuilder {
 
       ResourceSet resourceSet = getResourceSetProvider().get(getProject());
       resourceSet.getLoadOptions().put(ResourceDescriptionsProvider.NAMED_BUILDER_SCOPE, Boolean.TRUE);
-      if (resourceSet instanceof ResourceSetImpl) {
+      if (resourceSet instanceof ResourceSetImpl && ((ResourceSetImpl) resourceSet).getURIResourceMap() == null) {
         ((ResourceSetImpl) resourceSet).setURIResourceMap(Maps.<URI, Resource> newHashMap());
       }
       BuildData buildData = new BuildData(getProject().getName(), resourceSet, toBeBuilt, queuedBuildData);
@@ -200,4 +201,3 @@ public class RebuildingXtextBuilder extends XtextBuilder {
     }
   }
 }
-

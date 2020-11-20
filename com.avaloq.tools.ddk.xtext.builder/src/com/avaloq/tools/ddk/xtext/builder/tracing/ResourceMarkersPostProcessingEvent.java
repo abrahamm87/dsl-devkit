@@ -10,24 +10,23 @@
  *******************************************************************************/
 package com.avaloq.tools.ddk.xtext.builder.tracing;
 
-import com.avaloq.tools.ddk.xtext.tracing.TraceEvent;
+import com.avaloq.tools.ddk.xtext.tracing.ResourceEvent;
 
 
 /**
- * Event that occurs when the builder closes a cluster.
- * Holds the size of the cluster as data.
+ * An event representing the post-processing of a resource's markers during the build. This event will have a {@link ResourceValidationEvent} as its parent.
  */
-public class ClusterClosedEvent extends TraceEvent {
+public class ResourceMarkersPostProcessingEvent extends ResourceEvent {
 
   /**
-   * Creates a new instance of {@link ClusterClosedEvent}.
+   * Creates a new instance of {@link ResourceMarkersPostProcessingEvent}.
    *
    * @param trigger
    *          event trigger
    * @param data
-   *          the first and only item is expected to represent the size of the cluster
+   *          event data, where the first data object is expected to be the resource's {@link org.eclipse.emf.common.util.URI} this event pertains to
    */
-  public ClusterClosedEvent(final Trigger trigger, final Object... data) {
+  public ResourceMarkersPostProcessingEvent(final Trigger trigger, final Object... data) {
     super(trigger, data);
   }
 

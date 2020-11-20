@@ -23,7 +23,6 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.ThreadFactory;
 
 import org.apache.log4j.Logger;
 import org.eclipse.core.resources.IProject;
@@ -38,9 +37,11 @@ import org.eclipse.xtext.ui.resource.IResourceSetProvider;
 import org.eclipse.xtext.util.Triple;
 import org.eclipse.xtext.util.Tuples;
 
+import com.avaloq.tools.ddk.xtext.build.BuildPhases;
 import com.avaloq.tools.ddk.xtext.builder.tracing.LoaderDequeueEvent;
 import com.avaloq.tools.ddk.xtext.builder.tracing.ResourceLoadEvent;
 import com.avaloq.tools.ddk.xtext.linking.ILazyLinkingResource2;
+import com.avaloq.tools.ddk.xtext.resource.persistence.DirectLinkingSourceLevelURIsAdapter;
 import com.avaloq.tools.ddk.xtext.tracing.ITraceSet;
 import com.avaloq.tools.ddk.xtext.util.EmfResourceSetUtil;
 import com.google.common.base.Joiner;
@@ -163,6 +164,8 @@ public class ParallelResourceLoader extends AbstractResourceLoader {
         @Override
         protected ResourceSet initialValue() {
           ResourceSet resourceSet = getResourceSetProvider().get(project);
+          BuildPhases.setIndexing(resourceSet, BuildPhases.isIndexing(parent));
+          DirectLinkingSourceLevelURIsAdapter.setSourceLevelUris(resourceSet, DirectLinkingSourceLevelURIsAdapter.findInstalledAdapter(parent).getSourceLevelURIs());
           resourceSet.getLoadOptions().putAll(parent.getLoadOptions());
           // we are not loading as part of a build
           resourceSet.getLoadOptions().remove(ResourceDescriptionsProvider.NAMED_BUILDER_SCOPE);
@@ -237,7 +240,15 @@ public class ParallelResourceLoader extends AbstractResourceLoader {
         Resource resource = result.getSecond();
         if (resource == null) {
           // null when parallel loading is not supported
-          resource = parent.getResource(uri, true);
+          try {
+            resource = parent.getResource(uri, true);
+          } catch (WrappedException e) {
+            throw new LoadOperationException(uri, e.exception());
+            // CHECKSTYLE:OFF
+          } catch (Exception e) {
+            // CHECKSTYLE:ON
+            throw new LoadOperationException(uri, e);
+          }
         }
         return new LoadResult(resource, uri);
       } finally {
